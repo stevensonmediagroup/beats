@@ -1,6 +1,9 @@
 package main
 
 import (
+	"archive/zip"
+	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -223,5 +226,86 @@ func TestMediaRejectsTraversal(t *testing.T) {
 	h.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/media?folder=Music&path=..%2Fsecret.mp3", nil))
 	if res.Code != http.StatusNotFound {
 		t.Fatalf("status = %d", res.Code)
+	}
+}
+
+func TestArchiveDownloadAndConfirmedDeletion(t *testing.T) {
+	root := t.TempDir()
+	audioPath := filepath.Join(root, "track.mp3")
+	if err := os.WriteFile(audioPath, []byte("audio"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	q := newQueue("/bin/true", t.TempDir(), map[string]string{"Music": root})
+	h, err := handler(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	created := httptest.NewRecorder()
+	h.ServeHTTP(created, httptest.NewRequest(http.MethodPost, "/api/archive", nil))
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
+	}
+	var result struct {
+		ID, Download string
+		Files        int
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.ID == "" || result.Files != 1 {
+		t.Fatalf("archive = %#v", result)
+	}
+
+	download := httptest.NewRecorder()
+	h.ServeHTTP(download, httptest.NewRequest(http.MethodGet, result.Download, nil))
+	if download.Code != http.StatusOK {
+		t.Fatalf("download status=%d", download.Code)
+	}
+	zr, err := zip.NewReader(bytes.NewReader(download.Body.Bytes()), int64(download.Body.Len()))
+	if err != nil || len(zr.File) != 1 || zr.File[0].Name != "Music/track.mp3" {
+		t.Fatalf("zip files=%v err=%v", zr.File, err)
+	}
+	if _, err := os.Stat(audioPath); err != nil {
+		t.Fatalf("source deleted before confirmation: %v", err)
+	}
+
+	confirmed := httptest.NewRecorder()
+	h.ServeHTTP(confirmed, httptest.NewRequest(http.MethodPost, "/api/archive/confirm?id="+result.ID, nil))
+	if confirmed.Code != http.StatusOK {
+		t.Fatalf("confirm status=%d body=%s", confirmed.Code, confirmed.Body.String())
+	}
+	if _, err := os.Stat(audioPath); !os.IsNotExist(err) {
+		t.Fatalf("source was not deleted: %v", err)
+	}
+}
+
+func TestArchiveConfirmationRefusesChangedFiles(t *testing.T) {
+	root := t.TempDir()
+	audioPath := filepath.Join(root, "track.mp3")
+	if err := os.WriteFile(audioPath, []byte("audio"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	q := newQueue("/bin/true", t.TempDir(), map[string]string{"Music": root})
+	h, err := handler(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := httptest.NewRecorder()
+	h.ServeHTTP(created, httptest.NewRequest(http.MethodPost, "/api/archive", nil))
+	var result struct{ ID string }
+	if err := json.Unmarshal(created.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(audioPath, []byte("changed audio"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	confirmed := httptest.NewRecorder()
+	h.ServeHTTP(confirmed, httptest.NewRequest(http.MethodPost, "/api/archive/confirm?id="+result.ID, nil))
+	if confirmed.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s", confirmed.Code, confirmed.Body.String())
+	}
+	if _, err := os.Stat(audioPath); err != nil {
+		t.Fatalf("changed file was deleted: %v", err)
 	}
 }

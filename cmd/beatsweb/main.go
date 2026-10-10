@@ -2,11 +2,15 @@
 package main
 
 import (
+	"archive/zip"
+	"crypto/rand"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"mime"
@@ -272,9 +276,10 @@ func (q *queue) update(j *job, status, output string, finished bool) {
 }
 
 type server struct {
-	queue   *queue
-	workdir string
-	setupMu *sync.Mutex
+	queue     *queue
+	workdir   string
+	setupMu   *sync.Mutex
+	archiveMu *sync.Mutex
 }
 
 func validQuality(quality string) bool {
@@ -479,6 +484,21 @@ type libraryItem struct {
 	Modified string `json:"modified"`
 }
 
+type archiveEntry struct {
+	Folder  string `json:"folder"`
+	Root    string `json:"root"`
+	Path    string `json:"path"`
+	Size    int64  `json:"size"`
+	ModTime int64  `json:"mod_time"`
+}
+
+type archiveManifest struct {
+	ID      string         `json:"id"`
+	Name    string         `json:"name"`
+	Created string         `json:"created"`
+	Entries []archiveEntry `json:"entries"`
+}
+
 func isAudio(path string) bool {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".flac", ".m4a", ".aac", ".mp3", ".ogg", ".opus", ".wav":
@@ -524,6 +544,231 @@ func (s server) library(w http.ResponseWriter, r *http.Request) {
 	sort.Slice(items, func(i, j int) bool { return items[i].Modified > items[j].Modified })
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(items)
+}
+
+func archiveID() (string, error) {
+	data := make([]byte, 16)
+	if _, err := rand.Read(data); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(data), nil
+}
+
+func validArchiveID(id string) bool {
+	if len(id) != 32 {
+		return false
+	}
+	_, err := hex.DecodeString(id)
+	return err == nil
+}
+
+func (s server) archivesDir() string { return filepath.Join(s.workdir, "exports") }
+
+func (s server) createArchive(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	s.archiveMu.Lock()
+	defer s.archiveMu.Unlock()
+	id, err := archiveID()
+	if err != nil {
+		http.Error(w, `{"error":"Could not create archive"}`, http.StatusInternalServerError)
+		return
+	}
+	dir := s.archivesDir()
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		http.Error(w, `{"error":"Could not prepare archive storage"}`, http.StatusInternalServerError)
+		return
+	}
+	name := "beats-library-" + time.Now().UTC().Format("20060102-150405") + ".zip"
+	zipPath := filepath.Join(dir, id+".zip")
+	temporary, err := os.CreateTemp(dir, ".beats-archive-*.zip")
+	if err != nil {
+		http.Error(w, `{"error":"Could not create archive"}`, http.StatusInternalServerError)
+		return
+	}
+	temporaryPath := temporary.Name()
+	cleanup := func() { _ = temporary.Close(); _ = os.Remove(temporaryPath) }
+	zw := zip.NewWriter(temporary)
+	manifest := archiveManifest{ID: id, Name: name, Created: time.Now().UTC().Format(time.RFC3339)}
+	for folder, root := range s.queue.folders {
+		resolvedRoot, resolveErr := filepath.EvalSymlinks(root)
+		if errors.Is(resolveErr, os.ErrNotExist) {
+			continue
+		}
+		if resolveErr != nil {
+			err = resolveErr
+			break
+		}
+		err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || !isAudio(path) {
+				return nil
+			}
+			info, err := entry.Info()
+			if err != nil || !info.Mode().IsRegular() {
+				return err
+			}
+			relative, err := filepath.Rel(root, path)
+			if err != nil {
+				return err
+			}
+			source, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			folderName := strings.NewReplacer("/", "_", "\\", "_").Replace(folder)
+			header, err := zip.FileInfoHeader(info)
+			if err != nil {
+				_ = source.Close()
+				return err
+			}
+			header.Name = filepath.ToSlash(filepath.Join(folderName, relative))
+			header.Method = zip.Store
+			destination, err := zw.CreateHeader(header)
+			if err == nil {
+				_, err = io.Copy(destination, source)
+			}
+			_ = source.Close()
+			if err != nil {
+				return err
+			}
+			manifest.Entries = append(manifest.Entries, archiveEntry{Folder: folder, Root: resolvedRoot, Path: filepath.ToSlash(relative), Size: info.Size(), ModTime: info.ModTime().UnixNano()})
+			return nil
+		})
+		if errors.Is(err, os.ErrNotExist) {
+			err = nil
+		}
+		if err != nil {
+			break
+		}
+	}
+	if err == nil && len(manifest.Entries) == 0 {
+		err = errors.New("library is empty")
+	}
+	if closeErr := zw.Close(); err == nil {
+		err = closeErr
+	}
+	if closeErr := temporary.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		cleanup()
+		http.Error(w, `{"error":"Could not archive the library: `+strings.ReplaceAll(err.Error(), `"`, "")+`"}`, http.StatusUnprocessableEntity)
+		return
+	}
+	if err := os.Rename(temporaryPath, zipPath); err != nil {
+		cleanup()
+		http.Error(w, `{"error":"Could not save archive"}`, http.StatusInternalServerError)
+		return
+	}
+	manifestData, err := json.Marshal(manifest)
+	if err != nil || os.WriteFile(filepath.Join(dir, id+".json"), manifestData, 0600) != nil {
+		_ = os.Remove(zipPath)
+		http.Error(w, `{"error":"Could not save archive manifest"}`, http.StatusInternalServerError)
+		return
+	}
+	info, _ := os.Stat(zipPath)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "name": name, "size": info.Size(), "files": len(manifest.Entries), "download": "/api/archive/download?id=" + id})
+}
+
+func (s server) downloadArchive(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if !validArchiveID(id) {
+		http.NotFound(w, r)
+		return
+	}
+	data, err := os.ReadFile(filepath.Join(s.archivesDir(), id+".json"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	var manifest archiveManifest
+	if json.Unmarshal(data, &manifest) != nil || manifest.ID != id {
+		http.NotFound(w, r)
+		return
+	}
+	file, err := os.Open(filepath.Join(s.archivesDir(), id+".zip"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+manifest.Name+`"`)
+	http.ServeContent(w, r, manifest.Name, info.ModTime(), file)
+}
+
+func (s server) confirmArchive(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	s.archiveMu.Lock()
+	defer s.archiveMu.Unlock()
+	id := r.URL.Query().Get("id")
+	if !validArchiveID(id) {
+		http.NotFound(w, r)
+		return
+	}
+	manifestPath := filepath.Join(s.archivesDir(), id+".json")
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	var manifest archiveManifest
+	if json.Unmarshal(data, &manifest) != nil || manifest.ID != id {
+		http.NotFound(w, r)
+		return
+	}
+	targets := make([]string, 0, len(manifest.Entries))
+	for _, entry := range manifest.Entries {
+		root, ok := s.queue.folders[entry.Folder]
+		relative := filepath.Clean(filepath.FromSlash(entry.Path))
+		if !ok || filepath.IsAbs(relative) || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			http.Error(w, `{"error":"Archive manifest is no longer safe"}`, http.StatusConflict)
+			return
+		}
+		resolvedRoot, err := filepath.EvalSymlinks(root)
+		if err != nil || resolvedRoot != entry.Root {
+			http.Error(w, `{"error":"A library folder changed after the ZIP was created; nothing was deleted"}`, http.StatusConflict)
+			return
+		}
+		target, err := filepath.EvalSymlinks(filepath.Join(resolvedRoot, relative))
+		if err != nil || !strings.HasPrefix(target, resolvedRoot+string(filepath.Separator)) {
+			http.Error(w, `{"error":"A library file changed after the ZIP was created; nothing was deleted"}`, http.StatusConflict)
+			return
+		}
+		info, err := os.Stat(target)
+		if err != nil || !info.Mode().IsRegular() || info.Size() != entry.Size || info.ModTime().UnixNano() != entry.ModTime {
+			http.Error(w, `{"error":"A library file changed after the ZIP was created; nothing was deleted"}`, http.StatusConflict)
+			return
+		}
+		targets = append(targets, target)
+	}
+	for _, target := range targets {
+		if err := os.Remove(target); err != nil {
+			http.Error(w, `{"error":"Could not delete all archived files"}`, http.StatusInternalServerError)
+			return
+		}
+	}
+	_ = os.Remove(filepath.Join(s.archivesDir(), id+".zip"))
+	_ = os.Remove(manifestPath)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"deleted": len(targets)})
 }
 
 func (s server) media(w http.ResponseWriter, r *http.Request) {
@@ -612,7 +857,7 @@ func handler(q *queue) (http.Handler, error) {
 		return nil, err
 	}
 	mux := http.NewServeMux()
-	s := server{queue: q, workdir: q.workdir, setupMu: &sync.Mutex{}}
+	s := server{queue: q, workdir: q.workdir, setupMu: &sync.Mutex{}, archiveMu: &sync.Mutex{}}
 	mux.HandleFunc("/api/setup", s.setup)
 	mux.HandleFunc("/api/settings", s.settings)
 	mux.HandleFunc("/api/jobs", s.jobs)
@@ -620,6 +865,9 @@ func handler(q *queue) (http.Handler, error) {
 	mux.HandleFunc("/api/search", s.search)
 	mux.HandleFunc("/api/library", s.library)
 	mux.HandleFunc("/api/media", s.media)
+	mux.HandleFunc("/api/archive", s.createArchive)
+	mux.HandleFunc("/api/archive/download", s.downloadArchive)
+	mux.HandleFunc("/api/archive/confirm", s.confirmArchive)
 	mux.Handle("/", http.FileServer(http.FS(assets)))
 	return noStore(mux), nil
 }
