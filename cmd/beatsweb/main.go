@@ -141,6 +141,110 @@ func (q *queue) update(j *job, status, output string, finished bool) {
 type server struct {
 	queue   *queue
 	workdir string
+	setupMu *sync.Mutex
+}
+
+func (s server) configured() bool {
+	if _, err := config.Parse(filepath.Join(s.workdir, "beatportdl-config.yml")); err != nil {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(s.workdir, "beatportdl-credentials.json"))
+	return err == nil && !info.IsDir() && info.Size() > 0
+}
+
+func (s server) setup(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method == http.MethodGet {
+		_ = json.NewEncoder(w).Encode(map[string]bool{"configured": s.configured()})
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	s.setupMu.Lock()
+	defer s.setupMu.Unlock()
+	if s.configured() {
+		http.Error(w, `{"error":"Beats is already configured"}`, http.StatusConflict)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	var input struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+		Quality  string `json:"quality"`
+		Folder   string `json:"folder"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		http.Error(w, `{"error":"Invalid setup request"}`, http.StatusBadRequest)
+		return
+	}
+	input.Username = strings.TrimSpace(input.Username)
+	if input.Username == "" || input.Password == "" {
+		http.Error(w, `{"error":"Beatport username and password are required"}`, http.StatusBadRequest)
+		return
+	}
+	if input.Quality != "lossless" && input.Quality != "high" && input.Quality != "medium" && input.Quality != "medium-hls" {
+		http.Error(w, `{"error":"Select a valid audio quality"}`, http.StatusBadRequest)
+		return
+	}
+	destination, ok := s.queue.folders[input.Folder]
+	if !ok {
+		http.Error(w, `{"error":"Select a valid destination folder"}`, http.StatusBadRequest)
+		return
+	}
+	if err := os.MkdirAll(s.workdir, 0700); err != nil {
+		http.Error(w, `{"error":"Could not prepare the data directory"}`, http.StatusInternalServerError)
+		return
+	}
+
+	cacheTemp, err := os.CreateTemp(s.workdir, ".beatportdl-credentials-*")
+	if err != nil {
+		http.Error(w, `{"error":"Could not prepare credentials"}`, http.StatusInternalServerError)
+		return
+	}
+	cachePath := cacheTemp.Name()
+	_ = cacheTemp.Close()
+	_ = os.Remove(cachePath)
+	defer os.Remove(cachePath)
+
+	auth := beatport.NewAuth(input.Username, input.Password, cachePath)
+	bp := beatport.New("", auth)
+	if err := auth.Init(bp); err != nil {
+		http.Error(w, `{"error":"Beatport sign-in failed; check the account and subscription"}`, http.StatusUnauthorized)
+		return
+	}
+
+	cfg := &config.AppConfig{
+		Username: input.Username, Password: input.Password, Quality: input.Quality,
+		DownloadsDirectory: destination,
+	}
+	configTemp, err := os.CreateTemp(s.workdir, ".beatportdl-config-*")
+	if err != nil {
+		http.Error(w, `{"error":"Could not prepare configuration"}`, http.StatusInternalServerError)
+		return
+	}
+	configPath := configTemp.Name()
+	_ = configTemp.Close()
+	_ = os.Remove(configPath)
+	defer os.Remove(configPath)
+	if err := cfg.Save(configPath); err != nil || os.Chmod(configPath, 0600) != nil {
+		http.Error(w, `{"error":"Could not save configuration"}`, http.StatusInternalServerError)
+		return
+	}
+	if err := os.Rename(cachePath, filepath.Join(s.workdir, "beatportdl-credentials.json")); err != nil {
+		http.Error(w, `{"error":"Could not save credentials"}`, http.StatusInternalServerError)
+		return
+	}
+	if err := os.Rename(configPath, filepath.Join(s.workdir, "beatportdl-config.yml")); err != nil {
+		_ = os.Remove(filepath.Join(s.workdir, "beatportdl-credentials.json"))
+		http.Error(w, `{"error":"Could not save configuration"}`, http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+	_, _ = w.Write([]byte(`{"configured":true}`))
 }
 
 func (s server) jobs(w http.ResponseWriter, r *http.Request) {
@@ -149,6 +253,10 @@ func (s server) jobs(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		_ = json.NewEncoder(w).Encode(s.queue.list())
 	case http.MethodPost:
+		if !s.configured() {
+			http.Error(w, `{"error":"Complete first-run setup before adding downloads"}`, http.StatusPreconditionFailed)
+			return
+		}
 		var input struct {
 			Query  string `json:"query"`
 			Folder string `json:"folder"`
@@ -222,12 +330,22 @@ func handler(q *queue) (http.Handler, error) {
 		return nil, err
 	}
 	mux := http.NewServeMux()
-	s := server{queue: q, workdir: q.workdir}
+	s := server{queue: q, workdir: q.workdir, setupMu: &sync.Mutex{}}
+	mux.HandleFunc("/api/setup", s.setup)
 	mux.HandleFunc("/api/jobs", s.jobs)
 	mux.HandleFunc("/api/folders", s.folders)
 	mux.HandleFunc("/api/search", s.search)
 	mux.Handle("/", http.FileServer(http.FS(assets)))
-	return mux, nil
+	return noStore(mux), nil
+}
+
+func noStore(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Expires", "0")
+		next.ServeHTTP(w, r)
+	})
 }
 
 func main() {

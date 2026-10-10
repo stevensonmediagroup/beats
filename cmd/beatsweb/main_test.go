@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -17,7 +18,43 @@ func testQueue(t *testing.T) *queue {
 	if err := cfg.Save(filepath.Join(dir, "beatportdl-config.yml")); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(dir, "beatportdl-credentials.json"), []byte(`{"access_token":"test"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
 	return newQueue("/bin/true", dir, map[string]string{"Downloads": t.TempDir()})
+}
+
+func TestFirstRunSetupStatusIsNotCached(t *testing.T) {
+	dir := t.TempDir()
+	q := newQueue("/bin/true", dir, map[string]string{"Downloads": t.TempDir()})
+	h, err := handler(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := httptest.NewRecorder()
+	h.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/setup", nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d", res.Code)
+	}
+	if !strings.Contains(res.Body.String(), `"configured":false`) {
+		t.Fatalf("body = %s", res.Body.String())
+	}
+	if got := res.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
+		t.Fatalf("Cache-Control = %q", got)
+	}
+}
+
+func TestConfiguredStatus(t *testing.T) {
+	q := testQueue(t)
+	h, err := handler(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := httptest.NewRecorder()
+	h.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/setup", nil))
+	if !strings.Contains(res.Body.String(), `"configured":true`) {
+		t.Fatalf("body = %s", res.Body.String())
+	}
 }
 
 func TestJobsValidation(t *testing.T) {

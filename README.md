@@ -14,7 +14,7 @@ go build -o beats-web ./cmd/beatsweb
 ./beats-web
 ```
 
-Open `http://127.0.0.1:8080`. Search Beatport's catalog, select tracks or releases, choose a destination, and queue the download. The UI invokes `./beatportdl -q` and uses the same `beatportdl-config.yml`, credential cache, and quality settings as the CLI. Run `./beatportdl` once to create the configuration and authenticate before searching.
+Open `http://127.0.0.1:8080`. On first launch, the uncached setup screen signs in to Beatport and creates the local configuration and session cache. After setup, search Beatport's catalog, select tracks or releases, choose a destination, and queue the download. The UI invokes `./beatportdl -q` and uses the same `beatportdl-config.yml`, credential cache, and quality settings as the CLI.
 
 Configuration:
 
@@ -35,12 +35,11 @@ Build the image:
 docker compose build
 ```
 
-Create the ignored local data and download directories, then initialize BeatportDL interactively. When prompted for the downloads directory, enter `/downloads`:
+Create the ignored local data and download directories:
 
 ```shell
 mkdir -p data downloads archive
 chmod 700 data
-docker compose run --rm --entrypoint /usr/local/bin/beatportdl beats
 ```
 
 Start the web application:
@@ -50,7 +49,7 @@ docker compose up -d
 docker compose ps
 ```
 
-Open `http://localhost:8080`. Configuration and the sensitive session cache persist under `./data`; protect and back up that directory appropriately. Downloaded music is written to `./downloads` or `./archive`. These directories are excluded from the Docker build context, and the container runs as an unprivileged user. Set `PUID` and `PGID` if your host account does not use IDs `1000:1000`.
+Open `http://localhost:8080` and complete the first-run Beatport sign-in screen. Configuration and the sensitive session cache persist under `./data`; protect and back up that directory appropriately. Downloaded music is written to `./downloads` or `./archive`. These directories are excluded from the Docker build context, and the container runs as an unprivileged user. Set `PUID` and `PGID` if your host account does not use IDs `1000:1000`.
 
 To use different destinations, edit the `BEATS_FOLDERS` labels and matching volume mounts in `compose.yaml`. Container paths must be absolute.
 
