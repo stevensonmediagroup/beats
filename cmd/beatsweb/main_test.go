@@ -90,3 +90,50 @@ func TestParseFolders(t *testing.T) {
 		t.Fatalf("folders = %#v", got)
 	}
 }
+
+func TestLibraryListsAudioAndStreamsRanges(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "release"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	audio := []byte("0123456789")
+	if err := os.WriteFile(filepath.Join(root, "release", "track.mp3"), audio, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "notes.txt"), []byte("ignore"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	q := newQueue("/bin/true", t.TempDir(), map[string]string{"Music": root})
+	h, err := handler(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	list := httptest.NewRecorder()
+	h.ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/api/library", nil))
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), `"path":"release/track.mp3"`) || strings.Contains(list.Body.String(), "notes.txt") {
+		t.Fatalf("library status=%d body=%s", list.Code, list.Body.String())
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/api/media?folder=Music&path=release%2Ftrack.mp3", nil)
+	request.Header.Set("Range", "bytes=2-5")
+	stream := httptest.NewRecorder()
+	h.ServeHTTP(stream, request)
+	if stream.Code != http.StatusPartialContent || stream.Body.String() != "2345" {
+		t.Fatalf("media status=%d body=%q", stream.Code, stream.Body.String())
+	}
+}
+
+func TestMediaRejectsTraversal(t *testing.T) {
+	root := t.TempDir()
+	q := newQueue("/bin/true", t.TempDir(), map[string]string{"Music": root})
+	h, err := handler(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := httptest.NewRecorder()
+	h.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/media?folder=Music&path=..%2Fsecret.mp3", nil))
+	if res.Code != http.StatusNotFound {
+		t.Fatalf("status = %d", res.Code)
+	}
+}

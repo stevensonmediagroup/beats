@@ -9,10 +9,12 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"mime"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -286,6 +288,103 @@ func (s server) folders(w http.ResponseWriter, _ *http.Request) {
 	_ = json.NewEncoder(w).Encode(names)
 }
 
+type libraryItem struct {
+	Name     string `json:"name"`
+	Path     string `json:"path"`
+	Folder   string `json:"folder"`
+	Size     int64  `json:"size"`
+	Modified string `json:"modified"`
+}
+
+func isAudio(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".flac", ".m4a", ".aac", ".mp3", ".ogg", ".opus", ".wav":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s server) library(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	items := make([]libraryItem, 0)
+	for folder, root := range s.queue.folders {
+		_ = filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+			if len(items) >= 5000 {
+				return fs.SkipAll
+			}
+			if err != nil {
+				return nil
+			}
+			if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || !isAudio(path) {
+				return nil
+			}
+			info, err := entry.Info()
+			if err != nil || !info.Mode().IsRegular() {
+				return nil
+			}
+			relative, err := filepath.Rel(root, path)
+			if err != nil {
+				return nil
+			}
+			items = append(items, libraryItem{
+				Name: entry.Name(), Path: filepath.ToSlash(relative), Folder: folder,
+				Size: info.Size(), Modified: info.ModTime().UTC().Format(time.RFC3339),
+			})
+			return nil
+		})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].Modified > items[j].Modified })
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(items)
+}
+
+func (s server) media(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	root, ok := s.queue.folders[r.URL.Query().Get("folder")]
+	relative := filepath.Clean(filepath.FromSlash(r.URL.Query().Get("path")))
+	if !ok || relative == "." || filepath.IsAbs(relative) || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || !isAudio(relative) {
+		http.NotFound(w, r)
+		return
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	resolvedFile, err := filepath.EvalSymlinks(filepath.Join(resolvedRoot, relative))
+	if err != nil || !strings.HasPrefix(resolvedFile, resolvedRoot+string(filepath.Separator)) {
+		http.NotFound(w, r)
+		return
+	}
+	file, err := os.Open(resolvedFile)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		http.NotFound(w, r)
+		return
+	}
+	contentType := mime.TypeByExtension(strings.ToLower(filepath.Ext(resolvedFile)))
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Disposition", `inline; filename="`+strings.ReplaceAll(info.Name(), `"`, "")+`"`)
+	http.ServeContent(w, r, info.Name(), info.ModTime(), file)
+}
+
 func (s server) search(w http.ResponseWriter, r *http.Request) {
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
 	if query == "" {
@@ -335,6 +434,8 @@ func handler(q *queue) (http.Handler, error) {
 	mux.HandleFunc("/api/jobs", s.jobs)
 	mux.HandleFunc("/api/folders", s.folders)
 	mux.HandleFunc("/api/search", s.search)
+	mux.HandleFunc("/api/library", s.library)
+	mux.HandleFunc("/api/media", s.media)
 	mux.Handle("/", http.FileServer(http.FS(assets)))
 	return noStore(mux), nil
 }
