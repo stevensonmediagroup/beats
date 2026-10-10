@@ -57,6 +57,33 @@ func TestConfiguredStatus(t *testing.T) {
 	}
 }
 
+func TestSettingsUpdatesQualityWithoutExposingCredentials(t *testing.T) {
+	q := testQueue(t)
+	h, err := handler(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	get := httptest.NewRecorder()
+	h.ServeHTTP(get, httptest.NewRequest(http.MethodGet, "/api/settings", nil))
+	if get.Code != http.StatusOK || !strings.Contains(get.Body.String(), `"quality":"lossless"`) || strings.Contains(get.Body.String(), "pass") {
+		t.Fatalf("GET settings status=%d body=%s", get.Code, get.Body.String())
+	}
+
+	post := httptest.NewRecorder()
+	h.ServeHTTP(post, httptest.NewRequest(http.MethodPost, "/api/settings", strings.NewReader(`{"quality":"medium"}`)))
+	if post.Code != http.StatusOK {
+		t.Fatalf("POST settings status=%d body=%s", post.Code, post.Body.String())
+	}
+	cfg, err := config.Parse(filepath.Join(q.workdir, "beatportdl-config.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Quality != "medium" || cfg.Username != "user" || cfg.Password != "pass" {
+		t.Fatalf("updated config = %#v", cfg)
+	}
+}
+
 func TestJobsValidation(t *testing.T) {
 	q := testQueue(t)
 	h, err := handler(q)
@@ -73,13 +100,38 @@ func TestJobsValidation(t *testing.T) {
 }
 
 func TestQueueCompletes(t *testing.T) {
-	q := testQueue(t)
+	dir := t.TempDir()
+	downloads := t.TempDir()
+	cfg := &config.AppConfig{Username: "user", Password: "pass", DownloadsDirectory: downloads, Quality: "lossless", KeySystem: "standard-short", TrackExists: "update"}
+	if err := cfg.Save(filepath.Join(dir, "beatportdl-config.yml")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "beatportdl-credentials.json"), []byte(`{"access_token":"test"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	downloader := filepath.Join(t.TempDir(), "downloader")
+	if err := os.WriteFile(downloader, []byte("#!/bin/sh\nprintf audio > \""+filepath.Join(downloads, "track.mp3")+"\"\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	q := newQueue(downloader, dir, map[string]string{"Downloads": downloads})
 	j := q.add("https://www.beatport.com/track/example/1", "Downloads")
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) && q.list()[0].Status != "complete" {
 		time.Sleep(time.Millisecond)
 	}
 	if j.Status != "complete" {
+		t.Fatalf("status = %q, output = %q", j.Status, j.Output)
+	}
+}
+
+func TestQueueFailsWhenDownloaderProducesNoAudio(t *testing.T) {
+	q := testQueue(t)
+	j := q.add("https://www.beatport.com/track/example/1", "Downloads")
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && q.list()[0].Status != "failed" {
+		time.Sleep(time.Millisecond)
+	}
+	if j.Status != "failed" || !strings.Contains(j.Output, "no new or updated audio") {
 		t.Fatalf("status = %q, output = %q", j.Status, j.Output)
 	}
 }

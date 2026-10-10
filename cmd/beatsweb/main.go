@@ -73,6 +73,8 @@ func (q *queue) list() []*job {
 func (q *queue) worker() {
 	for j := range q.pending {
 		q.update(j, "downloading", "", false)
+		destination := q.folders[j.Folder]
+		before, _ := audioSnapshot(destination)
 		runDir, cleanup, err := q.runDirectory(j.Folder)
 		if err != nil {
 			q.update(j, "failed", err.Error(), true)
@@ -90,8 +92,59 @@ func (q *queue) worker() {
 			q.update(j, "failed", message, true)
 			continue
 		}
+		after, scanErr := audioSnapshot(destination)
+		if scanErr != nil {
+			q.update(j, "failed", "Downloader exited but the destination could not be scanned: "+scanErr.Error(), true)
+			continue
+		}
+		if !snapshotChanged(before, after) {
+			detail := "Downloader exited successfully but no new or updated audio file was found in the selected folder. Check the account subscription, quality, and folder permissions."
+			if message != "" {
+				detail += "\n\n" + message
+			}
+			q.update(j, "failed", detail, true)
+			continue
+		}
 		q.update(j, "complete", message, true)
 	}
+}
+
+type audioFileState struct {
+	size    int64
+	modTime int64
+}
+
+func audioSnapshot(root string) (map[string]audioFileState, error) {
+	result := make(map[string]audioFileState)
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || !isAudio(path) {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.Mode().IsRegular() {
+			result[path] = audioFileState{size: info.Size(), modTime: info.ModTime().UnixNano()}
+		}
+		return nil
+	})
+	if errors.Is(err, os.ErrNotExist) {
+		return result, nil
+	}
+	return result, err
+}
+
+func snapshotChanged(before, after map[string]audioFileState) bool {
+	for path, state := range after {
+		if previous, ok := before[path]; !ok || previous != state {
+			return true
+		}
+	}
+	return false
 }
 
 func (q *queue) runDirectory(folder string) (string, func(), error) {
@@ -99,6 +152,19 @@ func (q *queue) runDirectory(folder string) (string, func(), error) {
 	if !ok {
 		return "", func() {}, fmt.Errorf("unknown destination folder %q", folder)
 	}
+	if err := os.MkdirAll(destination, 0755); err != nil {
+		return "", func() {}, fmt.Errorf("prepare destination folder: %w", err)
+	}
+	probe, err := os.CreateTemp(destination, ".beats-write-test-*")
+	if err != nil {
+		return "", func() {}, fmt.Errorf("destination folder is not writable: %w", err)
+	}
+	probePath := probe.Name()
+	if err := probe.Close(); err != nil {
+		_ = os.Remove(probePath)
+		return "", func() {}, fmt.Errorf("test destination folder: %w", err)
+	}
+	_ = os.Remove(probePath)
 	cfg, err := config.Parse(filepath.Join(q.workdir, "beatportdl-config.yml"))
 	if err != nil {
 		return "", func() {}, fmt.Errorf("load BeatportDL config: %w", err)
@@ -146,6 +212,10 @@ type server struct {
 	setupMu *sync.Mutex
 }
 
+func validQuality(quality string) bool {
+	return quality == "lossless" || quality == "high" || quality == "medium" || quality == "medium-hls"
+}
+
 func (s server) configured() bool {
 	if _, err := config.Parse(filepath.Join(s.workdir, "beatportdl-config.yml")); err != nil {
 		return false
@@ -188,7 +258,7 @@ func (s server) setup(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"Beatport username and password are required"}`, http.StatusBadRequest)
 		return
 	}
-	if input.Quality != "lossless" && input.Quality != "high" && input.Quality != "medium" && input.Quality != "medium-hls" {
+	if !validQuality(input.Quality) {
 		http.Error(w, `{"error":"Select a valid audio quality"}`, http.StatusBadRequest)
 		return
 	}
@@ -247,6 +317,54 @@ func (s server) setup(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusCreated)
 	_, _ = w.Write([]byte(`{"configured":true}`))
+}
+
+func (s server) settings(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	cfgPath := filepath.Join(s.workdir, "beatportdl-config.yml")
+	cfg, err := config.Parse(cfgPath)
+	if err != nil {
+		http.Error(w, `{"error":"Complete first-run setup before changing settings"}`, http.StatusPreconditionFailed)
+		return
+	}
+	if r.Method == http.MethodGet {
+		_ = json.NewEncoder(w).Encode(map[string]string{"quality": cfg.Quality})
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	var input struct {
+		Quality string `json:"quality"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&input); err != nil || !validQuality(input.Quality) {
+		http.Error(w, `{"error":"Select a valid audio quality"}`, http.StatusBadRequest)
+		return
+	}
+	s.setupMu.Lock()
+	defer s.setupMu.Unlock()
+	cfg, err = config.Parse(cfgPath)
+	if err != nil {
+		http.Error(w, `{"error":"Could not load settings"}`, http.StatusInternalServerError)
+		return
+	}
+	cfg.Quality = input.Quality
+	temporary, err := os.CreateTemp(s.workdir, ".beatportdl-config-*")
+	if err != nil {
+		http.Error(w, `{"error":"Could not save settings"}`, http.StatusInternalServerError)
+		return
+	}
+	temporaryPath := temporary.Name()
+	_ = temporary.Close()
+	_ = os.Remove(temporaryPath)
+	defer os.Remove(temporaryPath)
+	if err := cfg.Save(temporaryPath); err != nil || os.Chmod(temporaryPath, 0600) != nil || os.Rename(temporaryPath, cfgPath) != nil {
+		http.Error(w, `{"error":"Could not save settings"}`, http.StatusInternalServerError)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]string{"quality": cfg.Quality})
 }
 
 func (s server) jobs(w http.ResponseWriter, r *http.Request) {
@@ -431,6 +549,7 @@ func handler(q *queue) (http.Handler, error) {
 	mux := http.NewServeMux()
 	s := server{queue: q, workdir: q.workdir, setupMu: &sync.Mutex{}}
 	mux.HandleFunc("/api/setup", s.setup)
+	mux.HandleFunc("/api/settings", s.settings)
 	mux.HandleFunc("/api/jobs", s.jobs)
 	mux.HandleFunc("/api/folders", s.folders)
 	mux.HandleFunc("/api/search", s.search)

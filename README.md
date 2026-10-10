@@ -14,7 +14,7 @@ go build -o beats-web ./cmd/beatsweb
 ./beats-web
 ```
 
-Open `http://127.0.0.1:8080`. On first launch, the uncached setup screen signs in to Beatport and creates the local configuration and session cache. After setup, search Beatport's catalog, select tracks or releases, choose a destination, and queue the download. Beats confirms when each item is queued and completed. The Library screen lists audio from configured download folders and provides an in-browser player with seek support. The UI invokes `./beatportdl -q` and uses the same `beatportdl-config.yml`, credential cache, and quality settings as the CLI.
+Open `http://127.0.0.1:8080`. On first launch, the uncached setup screen signs in to Beatport and creates the local configuration and session cache. After setup, search Beatport's catalog, select tracks or releases, choose a destination, and queue the download. Beats confirms completion only after detecting a new or updated audio file. The Library screen lists audio from configured download folders and provides an in-browser player with seek support. Use Settings to change download quality without signing in again; the selected quality must be supported by the account's subscription. The UI invokes `./beatportdl -q` and uses the same `beatportdl-config.yml`, credential cache, and quality settings as the CLI.
 
 Configuration:
 
