@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -131,8 +132,43 @@ func TestQueueFailsWhenDownloaderProducesNoAudio(t *testing.T) {
 	for time.Now().Before(deadline) && q.list()[0].Status != "failed" {
 		time.Sleep(time.Millisecond)
 	}
-	if j.Status != "failed" || !strings.Contains(j.Output, "no new or updated audio") {
+	if j.Status != "failed" || !strings.Contains(j.Output, "No audio file was created") {
 		t.Fatalf("status = %q, output = %q", j.Status, j.Output)
+	}
+}
+
+func TestQualityCandidatesFallBackFromMaximum(t *testing.T) {
+	got := qualityCandidates("lossless")
+	want := []string{"lossless", "high", "medium", "medium-hls"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("qualities = %#v", got)
+	}
+	got = qualityCandidates("medium")
+	if strings.Join(got, ",") != "medium,medium-hls" {
+		t.Fatalf("qualities = %#v", got)
+	}
+}
+
+func TestConvertToMP3ReplacesSource(t *testing.T) {
+	ffmpeg, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skip("ffmpeg is not installed")
+	}
+	dir := t.TempDir()
+	source := filepath.Join(dir, "track.wav")
+	command := exec.Command(ffmpeg, "-f", "lavfi", "-i", "sine=frequency=440:duration=0.1", "-y", source)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("create fixture: %v: %s", err, output)
+	}
+	if err := convertToMP3([]string{source}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(source); !os.IsNotExist(err) {
+		t.Fatalf("source still exists: %v", err)
+	}
+	info, err := os.Stat(filepath.Join(dir, "track.mp3"))
+	if err != nil || info.Size() == 0 {
+		t.Fatalf("MP3 missing or empty: %v", err)
 	}
 }
 

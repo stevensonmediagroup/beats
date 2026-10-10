@@ -75,38 +75,66 @@ func (q *queue) worker() {
 		q.update(j, "downloading", "", false)
 		destination := q.folders[j.Folder]
 		before, _ := audioSnapshot(destination)
-		runDir, cleanup, err := q.runDirectory(j.Folder)
+		cfg, err := config.Parse(filepath.Join(q.workdir, "beatportdl-config.yml"))
 		if err != nil {
-			q.update(j, "failed", err.Error(), true)
+			q.update(j, "failed", "load BeatportDL config: "+err.Error(), true)
 			continue
 		}
-		cmd := exec.Command(q.command, "-q", j.Query)
-		cmd.Dir = runDir
-		output, err := cmd.CombinedOutput()
-		cleanup()
-		message := strings.TrimSpace(string(output))
-		if err != nil {
-			if message == "" {
-				message = err.Error()
+		var attempts []string
+		finished := false
+		for _, quality := range qualityCandidates(cfg.Quality) {
+			runDir, cleanup, err := q.runDirectory(j.Folder, quality)
+			if err != nil {
+				attempts = append(attempts, quality+": "+err.Error())
+				break
 			}
-			q.update(j, "failed", message, true)
-			continue
-		}
-		after, scanErr := audioSnapshot(destination)
-		if scanErr != nil {
-			q.update(j, "failed", "Downloader exited but the destination could not be scanned: "+scanErr.Error(), true)
-			continue
-		}
-		if !snapshotChanged(before, after) {
-			detail := "Downloader exited successfully but no new or updated audio file was found in the selected folder. Check the account subscription, quality, and folder permissions."
+			cmd := exec.Command(q.command, "-q", j.Query)
+			cmd.Dir = runDir
+			output, runErr := cmd.CombinedOutput()
+			cleanup()
+			message := strings.TrimSpace(string(output))
+			if runErr != nil && message == "" {
+				message = runErr.Error()
+			}
 			if message != "" {
-				detail += "\n\n" + message
+				attempts = append(attempts, quality+": "+message)
+			}
+			after, scanErr := audioSnapshot(destination)
+			if scanErr != nil {
+				attempts = append(attempts, quality+": scan destination: "+scanErr.Error())
+				break
+			}
+			changed := changedAudioFiles(before, after)
+			if len(changed) == 0 {
+				continue
+			}
+			if err := convertToMP3(changed); err != nil {
+				q.update(j, "failed", "Audio downloaded at "+quality+" quality, but MP3 conversion failed: "+err.Error(), true)
+				finished = true
+				break
+			}
+			q.update(j, "complete", "Downloaded at "+quality+" quality and converted to 320 kbps MP3.", true)
+			finished = true
+			break
+		}
+		if !finished {
+			detail := "No audio file was created at any allowed quality. Check the subscription and folder permissions."
+			if len(attempts) > 0 {
+				detail += "\n\n" + strings.Join(attempts, "\n\n")
 			}
 			q.update(j, "failed", detail, true)
-			continue
 		}
-		q.update(j, "complete", message, true)
 	}
+}
+
+func qualityCandidates(preferred string) []string {
+	qualities := []string{"lossless", "high", "medium", "medium-hls"}
+	for i, quality := range qualities {
+		if quality == preferred {
+			return qualities[i:]
+		}
+	}
+	return qualities
 }
 
 type audioFileState struct {
@@ -138,16 +166,52 @@ func audioSnapshot(root string) (map[string]audioFileState, error) {
 	return result, err
 }
 
-func snapshotChanged(before, after map[string]audioFileState) bool {
+func changedAudioFiles(before, after map[string]audioFileState) []string {
+	var changed []string
 	for path, state := range after {
 		if previous, ok := before[path]; !ok || previous != state {
-			return true
+			changed = append(changed, path)
 		}
 	}
-	return false
+	sort.Strings(changed)
+	return changed
 }
 
-func (q *queue) runDirectory(folder string) (string, func(), error) {
+func convertToMP3(files []string) error {
+	for _, source := range files {
+		if strings.EqualFold(filepath.Ext(source), ".mp3") {
+			continue
+		}
+		target := strings.TrimSuffix(source, filepath.Ext(source)) + ".mp3"
+		temporary, err := os.CreateTemp(filepath.Dir(source), ".beats-convert-*.mp3")
+		if err != nil {
+			return fmt.Errorf("prepare output for %s: %w", filepath.Base(source), err)
+		}
+		temporaryPath := temporary.Name()
+		_ = temporary.Close()
+		_ = os.Remove(temporaryPath)
+		output, err := exec.Command("ffmpeg", "-nostdin", "-y", "-i", source, "-map", "0:a:0", "-map_metadata", "0", "-codec:a", "libmp3lame", "-b:a", "320k", temporaryPath).CombinedOutput()
+		if err != nil {
+			_ = os.Remove(temporaryPath)
+			return fmt.Errorf("convert %s: %w: %s", filepath.Base(source), err, strings.TrimSpace(string(output)))
+		}
+		info, err := os.Stat(temporaryPath)
+		if err != nil || info.Size() == 0 {
+			_ = os.Remove(temporaryPath)
+			return fmt.Errorf("convert %s: FFmpeg produced no audio", filepath.Base(source))
+		}
+		if err := os.Rename(temporaryPath, target); err != nil {
+			_ = os.Remove(temporaryPath)
+			return fmt.Errorf("save %s: %w", filepath.Base(target), err)
+		}
+		if err := os.Remove(source); err != nil {
+			return fmt.Errorf("MP3 saved but original %s could not be removed: %w", filepath.Base(source), err)
+		}
+	}
+	return nil
+}
+
+func (q *queue) runDirectory(folder, quality string) (string, func(), error) {
 	destination, ok := q.folders[folder]
 	if !ok {
 		return "", func() {}, fmt.Errorf("unknown destination folder %q", folder)
@@ -170,6 +234,7 @@ func (q *queue) runDirectory(folder string) (string, func(), error) {
 		return "", func() {}, fmt.Errorf("load BeatportDL config: %w", err)
 	}
 	cfg.DownloadsDirectory = destination
+	cfg.Quality = quality
 	dir, err := os.MkdirTemp("", "beats-job-")
 	if err != nil {
 		return "", func() {}, err
