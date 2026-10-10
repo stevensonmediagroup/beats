@@ -4,7 +4,7 @@ FROM golang:1.24-bookworm AS build
 ARG TAGLIB_VERSION=2.1.1
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        ca-certificates cmake curl g++ libz-dev make \
+        ca-certificates cmake curl g++ libutfcpp-dev libz-dev make \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL "https://github.com/taglib/taglib/archive/refs/tags/v${TAGLIB_VERSION}.tar.gz" -o /tmp/taglib.tar.gz \
