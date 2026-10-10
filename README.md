@@ -27,6 +27,33 @@ Configuration:
 
 Example: `BEATS_FOLDERS="Music=/srv/music,DJ Sets=/srv/sets" ./beats-web`
 
+## Docker
+
+Build the image:
+
+```shell
+docker compose build
+```
+
+Create the ignored local data and download directories, then initialize BeatportDL interactively. When prompted for the downloads directory, enter `/downloads`:
+
+```shell
+mkdir -p data downloads archive
+chmod 700 data
+docker compose run --rm --entrypoint /usr/local/bin/beatportdl beats
+```
+
+Start the web application:
+
+```shell
+docker compose up -d
+docker compose ps
+```
+
+Open `http://localhost:8080`. Configuration and the sensitive session cache persist under `./data`; protect and back up that directory appropriately. Downloaded music is written to `./downloads` or `./archive`. These directories are excluded from the Docker build context, and the container runs as an unprivileged user. Set `PUID` and `PGID` if your host account does not use IDs `1000:1000`.
+
+To use different destinations, edit the `BEATS_FOLDERS` labels and matching volume mounts in `compose.yaml`. Container paths must be absolute.
+
 ---
 
 ## BeatportDL CLI

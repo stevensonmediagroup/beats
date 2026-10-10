@@ -1,0 +1,15 @@
+services:
+  beats:
+    build:
+      context: .
+    image: beats:local
+    restart: unless-stopped
+    user: "${PUID:-1000}:${PGID:-1000}"
+    ports:
+      - "8080:8080"
+    environment:
+      BEATS_FOLDERS: "Downloads=/downloads,Archive=/archive"
+    volumes:
+      - ./data:/data
+      - ./downloads:/downloads
+      - ./archive:/archive

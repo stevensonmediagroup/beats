@@ -1,0 +1,13 @@
+.git
+.github
+.idea
+.vscode
+bin
+data
+downloads
+archive
+beatportdl
+beats-web
+beatportdl-config.yml
+beatportdl-credentials.json
+*.log
