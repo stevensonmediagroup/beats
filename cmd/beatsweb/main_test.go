@@ -1,0 +1,55 @@
+package main
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+	"unspok3n/beatportdl/config"
+)
+
+func testQueue(t *testing.T) *queue {
+	t.Helper()
+	dir := t.TempDir()
+	cfg := &config.AppConfig{Username: "user", Password: "pass", DownloadsDirectory: t.TempDir(), Quality: "lossless", KeySystem: "standard-short", TrackExists: "update"}
+	if err := cfg.Save(filepath.Join(dir, "beatportdl-config.yml")); err != nil {
+		t.Fatal(err)
+	}
+	return newQueue("/bin/true", dir, map[string]string{"Downloads": t.TempDir()})
+}
+
+func TestJobsValidation(t *testing.T) {
+	q := testQueue(t)
+	h, err := handler(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/jobs", strings.NewReader(`{"query":""}`))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	h.ServeHTTP(res, req)
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", res.Code)
+	}
+}
+
+func TestQueueCompletes(t *testing.T) {
+	q := testQueue(t)
+	j := q.add("https://www.beatport.com/track/example/1", "Downloads")
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && q.list()[0].Status != "complete" {
+		time.Sleep(time.Millisecond)
+	}
+	if j.Status != "complete" {
+		t.Fatalf("status = %q, output = %q", j.Status, j.Output)
+	}
+}
+
+func TestParseFolders(t *testing.T) {
+	got := parseFolders("Music=/srv/music,Archive=/mnt/archive,invalid")
+	if got["Music"] != "/srv/music" || len(got) != 2 {
+		t.Fatalf("folders = %#v", got)
+	}
+}

@@ -1,4 +1,35 @@
-# BeatportDL
+# Beats
+
+Beats is a Deemix-inspired web interface for the BeatportDL download engine. It provides a browser-based download queue for Beatport and Beatsource URLs and search queries while retaining the original command-line client.
+
+This project is based on [unspok3n/beatportdl](https://github.com/unspok3n/beatportdl) and remains licensed under GPL-3.0.
+
+## Web interface
+
+Build BeatportDL and the web server, then start the UI:
+
+```shell
+make linux-amd64
+go build -o beats-web ./cmd/beatsweb
+./beats-web
+```
+
+Open `http://127.0.0.1:8080`. Search Beatport's catalog, select tracks or releases, choose a destination, and queue the download. The UI invokes `./beatportdl -q` and uses the same `beatportdl-config.yml`, credential cache, and quality settings as the CLI. Run `./beatportdl` once to create the configuration and authenticate before searching.
+
+Configuration:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `BEATS_ADDR` | `127.0.0.1:8080` | Web server listen address |
+| `BEATPORTDL_BIN` | `./beatportdl` | BeatportDL executable path |
+| `BEATS_DATA_DIR` | `.` | Directory containing config, credentials, and downloads |
+| `BEATS_FOLDERS` | `Downloads=<data-dir>/downloads` | Comma-separated `Label=/absolute/path` destination allowlist |
+
+Example: `BEATS_FOLDERS="Music=/srv/music,DJ Sets=/srv/sets" ./beats-web`
+
+---
+
+## BeatportDL CLI
 
 Beatport & Beatsource downloader (FLAC, AAC)
 
