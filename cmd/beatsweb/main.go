@@ -194,7 +194,14 @@ func convertToMP3(files []string) error {
 		temporaryPath := temporary.Name()
 		_ = temporary.Close()
 		_ = os.Remove(temporaryPath)
-		output, err := exec.Command("ffmpeg", "-nostdin", "-y", "-i", source, "-map", "0:a:0", "-map_metadata", "0", "-codec:a", "libmp3lame", "-b:a", "320k", temporaryPath).CombinedOutput()
+		output, err := exec.Command(
+			"ffmpeg", "-nostdin", "-y", "-i", source,
+			"-map", "0:a:0", "-map", "0:v?", "-map_metadata", "0",
+			"-codec:a", "libmp3lame", "-b:a", "320k",
+			"-codec:v", "copy", "-disposition:v:0", "attached_pic",
+			"-id3v2_version", "3", "-write_id3v1", "1",
+			temporaryPath,
+		).CombinedOutput()
 		if err != nil {
 			_ = os.Remove(temporaryPath)
 			return fmt.Errorf("convert %s: %w: %s", filepath.Base(source), err, strings.TrimSpace(string(output)))
@@ -276,10 +283,12 @@ func (q *queue) update(j *job, status, output string, finished bool) {
 }
 
 type server struct {
-	queue     *queue
-	workdir   string
-	setupMu   *sync.Mutex
-	archiveMu *sync.Mutex
+	queue         *queue
+	workdir       string
+	setupMu       *sync.Mutex
+	archiveMu     *sync.Mutex
+	metadataMu    *sync.Mutex
+	metadataCache map[string]cachedMetadata
 }
 
 func validQuality(quality string) bool {
@@ -482,6 +491,85 @@ type libraryItem struct {
 	Folder   string `json:"folder"`
 	Size     int64  `json:"size"`
 	Modified string `json:"modified"`
+	Title    string `json:"title,omitempty"`
+	Artist   string `json:"artist,omitempty"`
+	Album    string `json:"album,omitempty"`
+	Genre    string `json:"genre,omitempty"`
+	Date     string `json:"date,omitempty"`
+	Track    string `json:"track,omitempty"`
+	Disc     string `json:"disc,omitempty"`
+	Label    string `json:"label,omitempty"`
+	Catalog  string `json:"catalog,omitempty"`
+	ISRC     string `json:"isrc,omitempty"`
+	Artwork  bool   `json:"artwork"`
+}
+
+type audioMetadata struct {
+	Title, Artist, Album, Genre, Date, Track, Disc, Label, Catalog, ISRC string
+	Artwork                                                              bool
+}
+
+type cachedMetadata struct {
+	state audioFileState
+	data  audioMetadata
+}
+
+func firstTag(tags map[string]string, names ...string) string {
+	for _, name := range names {
+		if value := tags[strings.ToLower(name)]; value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func probeMetadata(path string) audioMetadata {
+	output, err := exec.Command("ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", path).Output()
+	if err != nil {
+		return audioMetadata{}
+	}
+	var probe struct {
+		Format struct {
+			Tags map[string]string `json:"tags"`
+		} `json:"format"`
+		Streams []struct {
+			CodecType   string `json:"codec_type"`
+			Disposition struct {
+				AttachedPic int `json:"attached_pic"`
+			} `json:"disposition"`
+		} `json:"streams"`
+	}
+	if json.Unmarshal(output, &probe) != nil {
+		return audioMetadata{}
+	}
+	tags := make(map[string]string, len(probe.Format.Tags))
+	for key, value := range probe.Format.Tags {
+		tags[strings.ToLower(key)] = value
+	}
+	metadata := audioMetadata{
+		Title: firstTag(tags, "title"), Artist: firstTag(tags, "artist"), Album: firstTag(tags, "album"),
+		Genre: firstTag(tags, "genre"), Date: firstTag(tags, "date", "year"), Track: firstTag(tags, "track"),
+		Disc: firstTag(tags, "disc"), Label: firstTag(tags, "label", "publisher"),
+		Catalog: firstTag(tags, "catalognumber", "catalog_number"), ISRC: firstTag(tags, "isrc"),
+	}
+	for _, stream := range probe.Streams {
+		if stream.CodecType == "video" && stream.Disposition.AttachedPic == 1 {
+			metadata.Artwork = true
+			break
+		}
+	}
+	return metadata
+}
+
+func (s server) metadata(path string, state audioFileState) audioMetadata {
+	s.metadataMu.Lock()
+	defer s.metadataMu.Unlock()
+	if cached, ok := s.metadataCache[path]; ok && cached.state == state {
+		return cached.data
+	}
+	data := probeMetadata(path)
+	s.metadataCache[path] = cachedMetadata{state: state, data: data}
+	return data
 }
 
 type archiveEntry struct {
@@ -538,6 +626,10 @@ func (s server) library(w http.ResponseWriter, r *http.Request) {
 				Name: entry.Name(), Path: filepath.ToSlash(relative), Folder: folder,
 				Size: info.Size(), Modified: info.ModTime().UTC().Format(time.RFC3339),
 			})
+			metadata := s.metadata(path, audioFileState{size: info.Size(), modTime: info.ModTime().UnixNano()})
+			item := &items[len(items)-1]
+			item.Title, item.Artist, item.Album, item.Genre, item.Date = metadata.Title, metadata.Artist, metadata.Album, metadata.Genre, metadata.Date
+			item.Track, item.Disc, item.Label, item.Catalog, item.ISRC, item.Artwork = metadata.Track, metadata.Disc, metadata.Label, metadata.Catalog, metadata.ISRC, metadata.Artwork
 			return nil
 		})
 	}
@@ -777,19 +869,8 @@ func (s server) media(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	root, ok := s.queue.folders[r.URL.Query().Get("folder")]
-	relative := filepath.Clean(filepath.FromSlash(r.URL.Query().Get("path")))
-	if !ok || relative == "." || filepath.IsAbs(relative) || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || !isAudio(relative) {
-		http.NotFound(w, r)
-		return
-	}
-	resolvedRoot, err := filepath.EvalSymlinks(root)
+	resolvedFile, err := resolveLibraryFile(s.queue.folders, r.URL.Query().Get("folder"), r.URL.Query().Get("path"))
 	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	resolvedFile, err := filepath.EvalSymlinks(filepath.Join(resolvedRoot, relative))
-	if err != nil || !strings.HasPrefix(resolvedFile, resolvedRoot+string(filepath.Separator)) {
 		http.NotFound(w, r)
 		return
 	}
@@ -811,6 +892,39 @@ func (s server) media(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Disposition", `inline; filename="`+strings.ReplaceAll(info.Name(), `"`, "")+`"`)
 	http.ServeContent(w, r, info.Name(), info.ModTime(), file)
+}
+
+func resolveLibraryFile(folders map[string]string, folder, requestedPath string) (string, error) {
+	root, ok := folders[folder]
+	relative := filepath.Clean(filepath.FromSlash(requestedPath))
+	if !ok || relative == "." || filepath.IsAbs(relative) || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || !isAudio(relative) {
+		return "", errors.New("invalid library path")
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", err
+	}
+	resolvedFile, err := filepath.EvalSymlinks(filepath.Join(resolvedRoot, relative))
+	if err != nil || !strings.HasPrefix(resolvedFile, resolvedRoot+string(filepath.Separator)) {
+		return "", errors.New("library path escapes its folder")
+	}
+	return resolvedFile, nil
+}
+
+func (s server) artwork(w http.ResponseWriter, r *http.Request) {
+	resolvedFile, err := resolveLibraryFile(s.queue.folders, r.URL.Query().Get("folder"), r.URL.Query().Get("path"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	output, err := exec.Command("ffmpeg", "-v", "error", "-i", resolvedFile, "-map", "0:v:0", "-frames:v", "1", "-f", "image2pipe", "-codec:v", "mjpeg", "pipe:1").Output()
+	if err != nil || len(output) == 0 || len(output) > 10<<20 {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(output)))
+	_, _ = w.Write(output)
 }
 
 func (s server) search(w http.ResponseWriter, r *http.Request) {
@@ -857,7 +971,7 @@ func handler(q *queue) (http.Handler, error) {
 		return nil, err
 	}
 	mux := http.NewServeMux()
-	s := server{queue: q, workdir: q.workdir, setupMu: &sync.Mutex{}, archiveMu: &sync.Mutex{}}
+	s := server{queue: q, workdir: q.workdir, setupMu: &sync.Mutex{}, archiveMu: &sync.Mutex{}, metadataMu: &sync.Mutex{}, metadataCache: make(map[string]cachedMetadata)}
 	mux.HandleFunc("/api/setup", s.setup)
 	mux.HandleFunc("/api/settings", s.settings)
 	mux.HandleFunc("/api/jobs", s.jobs)
@@ -865,6 +979,7 @@ func handler(q *queue) (http.Handler, error) {
 	mux.HandleFunc("/api/search", s.search)
 	mux.HandleFunc("/api/library", s.library)
 	mux.HandleFunc("/api/media", s.media)
+	mux.HandleFunc("/api/artwork", s.artwork)
 	mux.HandleFunc("/api/archive", s.createArchive)
 	mux.HandleFunc("/api/archive/download", s.downloadArchive)
 	mux.HandleFunc("/api/archive/confirm", s.confirmArchive)

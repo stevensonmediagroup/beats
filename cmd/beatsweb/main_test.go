@@ -158,8 +158,19 @@ func TestConvertToMP3ReplacesSource(t *testing.T) {
 		t.Skip("ffmpeg is not installed")
 	}
 	dir := t.TempDir()
-	source := filepath.Join(dir, "track.wav")
-	command := exec.Command(ffmpeg, "-f", "lavfi", "-i", "sine=frequency=440:duration=0.1", "-y", source)
+	cover := filepath.Join(dir, "cover.jpg")
+	if output, err := exec.Command(ffmpeg, "-f", "lavfi", "-i", "color=c=red:s=32x32", "-frames:v", "1", "-y", cover).CombinedOutput(); err != nil {
+		t.Fatalf("create artwork: %v: %s", err, output)
+	}
+	source := filepath.Join(dir, "track.flac")
+	command := exec.Command(ffmpeg,
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-i", cover,
+		"-map", "0:a:0", "-map", "1:v:0", "-codec:a", "flac", "-codec:v", "copy", "-disposition:v:0", "attached_pic",
+		"-metadata", "title=Metadata Song", "-metadata", "artist=Metadata Artist", "-metadata", "album=Metadata Album",
+		"-metadata", "genre=House", "-metadata", "date=2026", "-metadata", "track=3", "-metadata", "disc=1",
+		"-metadata", "ISRC=USAAA2600001", "-metadata", "LABEL=Metadata Label", "-metadata", "CATALOGNUMBER=CAT-001",
+		"-y", source,
+	)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("create fixture: %v: %s", err, output)
 	}
@@ -169,9 +180,15 @@ func TestConvertToMP3ReplacesSource(t *testing.T) {
 	if _, err := os.Stat(source); !os.IsNotExist(err) {
 		t.Fatalf("source still exists: %v", err)
 	}
-	info, err := os.Stat(filepath.Join(dir, "track.mp3"))
+	target := filepath.Join(dir, "track.mp3")
+	info, err := os.Stat(target)
 	if err != nil || info.Size() == 0 {
 		t.Fatalf("MP3 missing or empty: %v", err)
+	}
+	metadata := probeMetadata(target)
+	if metadata.Title != "Metadata Song" || metadata.Artist != "Metadata Artist" || metadata.Album != "Metadata Album" || metadata.ISRC != "USAAA2600001" || !metadata.Artwork {
+		probe, _ := exec.Command("ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", target).CombinedOutput()
+		t.Fatalf("metadata not preserved: %#v\n%s", metadata, probe)
 	}
 }
 
