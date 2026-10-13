@@ -1,249 +1,154 @@
 # Beats
 
-Beats is a Deemix-inspired web interface for the BeatportDL download engine. It provides a browser-based download queue for Beatport and Beatsource URLs and search queries while retaining the original command-line client.
+Put Beatport downloads behind a clean web interface instead of babysitting a terminal.
 
-This project is based on [unspok3n/beatportdl](https://github.com/unspok3n/beatportdl) and remains licensed under GPL-3.0.
+Beats lets you search the Beatport catalog, pick tracks and releases, choose where they belong, and follow each download from the queue to your library. Finished tracks are converted to 320 kbps MP3 while keeping the useful details: cover art, title, artist, album, genre, release date, track and disc numbers, label, catalog number, and ISRC.
 
-## Web interface
+If you liked the simple workflow of Deemix and want something similar for music available through your Beatport or Beatsource streaming plan, download Beats and give it a run.
 
-Build BeatportDL and the web server, then start the UI:
+> Beats requires an active Beatport Streaming or Beatsource subscription. Please use it only for music you are entitled to access and follow the service terms that apply to your account.
+
+## What you get
+
+- A first-run sign-in screen—no config file editing required
+- Beatport catalog search and direct URL support
+- A download queue with clear success and failure states
+- Automatic fallback to a quality accepted by your subscription
+- Automatic 320 kbps MP3 conversion after a successful download
+- Preserved tags and embedded album artwork
+- A library with cover art, metadata, and an in-browser player
+- Named download folders for keeping music organized
+- One-click library ZIP creation
+- Explicit confirmation before archived originals are deleted
+- Docker support with persistent data and download folders
+
+## The quickest way to try it
+
+Docker Compose is the easiest route:
 
 ```shell
-make linux-amd64
+git clone https://github.com/stevensonmediagroup/beats.git
+cd beats
+mkdir -p data downloads archive
+chmod 700 data
+docker compose up -d --build
+```
+
+Open [http://localhost:8080](http://localhost:8080), sign in to Beatport on the setup screen, and start searching.
+
+Your files stay on the host:
+
+| Host directory | Contents |
+| --- | --- |
+| `./data` | BeatportDL configuration and session data |
+| `./downloads` | Main music library |
+| `./archive` | Optional second destination |
+
+Treat `./data` as private because it contains the saved Beatport session. It is ignored by Git and is not copied into the Docker image.
+
+Useful Docker commands:
+
+```shell
+# Check whether the service is healthy
+docker compose ps
+
+# Follow the application log
+docker compose logs -f beats
+
+# Pull in repository changes and rebuild
+git pull
+docker compose up -d --build
+
+# Stop the service without deleting your music or configuration
+docker compose down
+```
+
+The container runs as user and group `1000:1000` by default. If that does not match the account that owns your music directories, set `PUID` and `PGID` before starting it:
+
+```shell
+PUID="$(id -u)" PGID="$(id -g)" docker compose up -d --build
+```
+
+## How Beats handles a download
+
+1. You search for music or paste a supported Beatport or Beatsource URL.
+2. You choose a configured destination folder and add the item to the queue.
+3. Beats tries your preferred source quality, then lower supported qualities if the service rejects it.
+4. A completed source file is converted to 320 kbps MP3.
+5. FFmpeg carries the source metadata and embedded artwork into the MP3.
+6. Beats validates that the MP3 exists before reporting the job as complete.
+7. Only after successful conversion does it remove the original FLAC, M4A, or AAC file.
+
+The Library page reads metadata from the finished files and shows whatever is available. You can play a track in the browser or package the whole library into a ZIP. Building a ZIP does not delete the music. Deletion happens only after you download the archive and press the confirmation button; Beats refuses the deletion if an archived file changed after the ZIP was built.
+
+## Choose your download folders
+
+The included Compose file exposes two destinations:
+
+```yaml
+BEATS_FOLDERS: "Downloads=/downloads,Archive=/archive"
+```
+
+To add or rename destinations, edit `BEATS_FOLDERS` in `compose.yaml` and add a matching volume mount. Paths inside the container must be absolute.
+
+For a native installation, use the same variable when starting the server:
+
+```shell
+BEATS_FOLDERS="Music=/srv/music,DJ Sets=/srv/sets" ./beats-web
+```
+
+## Run it without Docker
+
+You need Go 1.24, FFmpeg, TagLib 2, a C/C++ compiler, and zlib development headers.
+
+Build both programs from the repository root:
+
+```shell
+go build -o beatportdl ./cmd/beatportdl
 go build -o beats-web ./cmd/beatsweb
 ./beats-web
 ```
 
-Open `http://127.0.0.1:8080`. On first launch, the uncached setup screen signs in to Beatport and creates the local configuration and session cache. After setup, search Beatport's catalog, select tracks or releases, choose a destination, and queue the download. Beats tries source qualities from the selected maximum downward until the subscription accepts one, converts each completed download to 320 kbps MP3, preserves its tags and embedded cover art, validates the result, and then removes the source FLAC/M4A/AAC file. Beats confirms completion only after detecting the resulting audio. The Library screen shows cover art and available title, artist, album, genre, year, track/disc, label, catalog number, and ISRC metadata, and provides an in-browser player with seek support. It can also build one ZIP of the current library; originals remain on the server until the user downloads the ZIP and explicitly confirms deletion. Confirmation is refused if any archived file changed in the meantime. Use Settings to change the maximum source quality without signing in again. The UI invokes `./beatportdl -q` and uses the same `beatportdl-config.yml` and credential cache as the CLI.
+Then open [http://127.0.0.1:8080](http://127.0.0.1:8080).
 
-Configuration:
+Runtime settings:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `BEATS_ADDR` | `127.0.0.1:8080` | Web server listen address |
-| `BEATPORTDL_BIN` | `./beatportdl` | BeatportDL executable path |
-| `BEATS_DATA_DIR` | `.` | Directory containing config, credentials, and downloads |
-| `BEATS_FOLDERS` | `Downloads=<data-dir>/downloads` | Comma-separated `Label=/absolute/path` destination allowlist |
+| `BEATS_ADDR` | `127.0.0.1:8080` | Address used by the web server |
+| `BEATPORTDL_BIN` | `./beatportdl` | Path to the downloader executable |
+| `BEATS_DATA_DIR` | `.` | Location of configuration, session data, and the default download folder |
+| `BEATS_FOLDERS` | `Downloads=<data-dir>/downloads` | Comma-separated `Name=/absolute/path` destination list |
 
-Example: `BEATS_FOLDERS="Music=/srv/music,DJ Sets=/srv/sets" ./beats-web`
-
-## Docker
-
-Build the image:
+Equivalent command-line flags are available:
 
 ```shell
+./beats-web -addr 0.0.0.0:8080 -downloader ./beatportdl -workdir ./data
+```
+
+## Supported links
+
+The underlying downloader accepts Beatport and Beatsource tracks, releases, playlists, charts, labels, and artists. Add `@beatsource` to a search when you want Beatsource results instead of the default Beatport results.
+
+The original command-line program remains available as `beatportdl` for anyone who prefers terminal use or needs its advanced configuration. Run it once interactively to create `beatportdl-config.yml`, or see the [upstream BeatportDL project](https://github.com/unspok3n/beatportdl) for its complete option and template reference.
+
+## Build and test
+
+```shell
+go test ./cmd/beatsweb ./internal/beatport ./config
 docker compose build
 ```
 
-Create the ignored local data and download directories:
+The Docker build runs the Go test suite before producing the final image.
 
-```shell
-mkdir -p data downloads archive
-chmod 700 data
-```
+## Project roots and license
 
-Start the web application:
+Beats is built on [unspok3n/beatportdl](https://github.com/unspok3n/beatportdl). That project supplied the downloader engine; this repository adds the browser workflow, library, conversion pipeline, archive controls, and Docker packaging.
 
-```shell
-docker compose up -d
-docker compose ps
-```
+The code is distributed under the [GNU General Public License v3.0](LICENSE). If you redistribute a modified version, keep the license and corresponding source obligations intact.
 
-Open `http://localhost:8080` and complete the first-run Beatport sign-in screen. Configuration and the sensitive session cache persist under `./data`; protect and back up that directory appropriately. Downloaded music is written to `./downloads` or `./archive`. These directories are excluded from the Docker build context, and the container runs as an unprivileged user. Set `PUID` and `PGID` if your host account does not use IDs `1000:1000`.
+## Contributing
 
-To use different destinations, edit the `BEATS_FOLDERS` labels and matching volume mounts in `compose.yaml`. Container paths must be absolute.
+Found a broken download state, a tag that does not survive conversion, or a library view that could be clearer? Open an issue with the behavior you saw, the source format, and the relevant application log. Pull requests are welcome too.
 
----
-
-## BeatportDL CLI
-
-Beatport & Beatsource downloader (FLAC, AAC)
-
-*Requires an active [Beatport](https://stream.beatport.com/) or [Beatsource](https://stream.beatsource.com/) streaming plan.*
-
-![Screenshot](/screenshots/main.png?raw=true "Screenshot")
-
-Setup
----
-1. [Download](https://github.com/unspok3n/beatportdl/releases/) or [build](#building) BeatportDL.
-
-     *Compiled binaries for Windows, macOS (amd64, arm64) and Linux (amd64, arm64) are available on the [Releases](https://github.com/unspok3n/beatportdl/releases) page.* \
-     *Don't forget to set the execute permission on unix systems, e.g., chmod +x beatportdl-darwin-arm64*
-
-2. Run beatportdl (e.g. `./beatportdl-darwin-arm64`), then specify the:
-   - Beatport username
-   - Beatport password
-   - Downloads directory
-   - Audio quality
-
-3. OPTIONAL: Customize a config file. Create a new config file by running:
-```shell
-./beatportdl
-```
-This will create a new `beatportdl-config.yml` file. You can put the following options and values into the config file:
-
----
-| Option                        | Default Value                             | Type       | Description                                                                                                                                                                               |
-|-------------------------------|-------------------------------------------|------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `username`                    |                                           | String     | Beatport username                                                                                                                                                                         |
-| `password`                    |                                           | String     | Beatport password                                                                                                                                                                         |
-| `quality`                     | lossless                                  | String     | Download quality *(medium-hls, medium, high, lossless)*                                                                                                                                   |
-| `show_progress`               | true                                      | Boolean    | Enable progress bars                                                                                                                                                                      |
-| `write_error_log`             | false                                     | Boolean    | Write errors to `error.log`                                                                                                                                                               |
-| `max_download_workers`        | 15                                        | Integer    | Concurrent download jobs limit                                                                                                                                                            |
-| `max_global_workers`          | 15                                        | Integer    | Concurrent global jobs limit                                                                                                                                                              |
-| `downloads_directory`         |                                           | String     | Location for the downloads directory                                                                                                                                                      |
-| `sort_by_context`             | false                                     | Boolean    | Create a directory for each release, playlist, chart, label, or artist                                                                                                                    |
-| `sort_by_label`               | false                                     | Boolean    | Use label names as parent directories for releases (requires `sort_by_context`)                                                                                                           |
-| `force_release_directories`   | false                                     | Boolean    | Create release directories inside chart and playlist folders (requires `sort_by_context`)                                                                                                 |
-| `track_exists`                | update                                    | String     | Behavior when track file already exists                                                                                                                                                   |
-| `track_number_padding`        | 2                                         | Integer    | Track number padding for filenames and tag mappings (when using `track_number_with_padding` or `release_track_count_with_padding`)<br/> Set to 0 for dynamic padding based on track count |
-| `cover_size`                  | 1400x1400                                 | String     | Cover art size for `keep_cover` and track metadata (if `fix_tags` is enabled)  *[max: 1400x1400]*                                                                                         |
-| `keep_cover`                  | false                                     | Boolean    | Download cover art file (cover.jpg) to the context directory (requires `sort_by_context`)                                                                                                 |
-| `fix_tags`                    | true                                      | Boolean    | Enable tag writing capabilities                                                                                                                                                           |
-| `tag_mappings`                | *Listed below*                            | String Map | Custom tag mappings                                                                                                                                                                       |
-| `track_file_template`         | {number}. {artists} - {name} ({mix_name}) | String     | Track filename template                                                                                                                                                                   |
-| `release_directory_template`  | [{catalog_number}] {artists} - {name}     | String     | Release directory template                                                                                                                                                                |
-| `playlist_directory_template` | {name} [{created_date}]                   | String     | Playlist directory template                                                                                                                                                               |
-| `chart_directory_template`    | {name} [{published_date}]                 | String     | Chart directory template                                                                                                                                                                  |
-| `label_directory_template`    | {name} [{updated_date}]                   | String     | Label directory template                                                                                                                                                                  |
-| `artist_directory_template`   | {name}                                    | String     | Artist directory template                                                                                                                                                                 |
-| `whitespace_character`        |                                           | String     | Whitespace character for track filenames and release directories                                                                                                                          |
-| `artists_limit`               | 3                                         | Integer    | Maximum number of artists allowed before replacing with `artists_short_form` (affects directories, filenames, and search results)                                                         |
-| `artists_short_form`          | VA                                        | String     | Custom string to represent "Various Artists"                                                                                                                                              |
-| `key_system`                  | standard-short                            | String     | Music key system used in filenames and tags                                                                                                                                               |
-| `proxy`                       |                                           | String     | Proxy URL                                                                                                                                                                                 |
-
-If the Beatport credentials are correct, you should also see the file `beatportdl-credentials.json` appear in the BeatportDL directory.
-*If you accidentally entered an incorrect password and got an error, you can always manually edit the config file*
-
-Download quality options, per Beatport/Beatsource subscription type:
-
-| Option       | Description                                                                                                  | Requires at least              | Notes                                                                   |
-|--------------|--------------------------------------------------------------------------------------------------------------|--------------------------------|-------------------------------------------------------------------------|
-| `medium-hls` | 128 kbps AAC through `/stream` endpoint (IMPORTANT: requires [ffmpeg](https://www.ffmpeg.org/download.html)) | Essential / Beatsource         | Same as `medium` on Advanced but uses a slightly slower download method |
-| `medium`     | 128 kbps AAC                                                                                                 | Advanced / Beatsource Pro+     |                                                                         |
-| `high`       | 256 kbps AAC                                                                                                 | Professional / Beatsource Pro+ |                                                                         |
-| `lossless`   | 44.1 kHz FLAC                                                                                                | Professional / Beatsource Pro+ |                                                                         |
-
-Available `track_exists` options:
-* `error` Log error and skip
-* `skip` Skip silently
-* `overwrite` Re-download
-* `update` Update tags
-
-Available template keywords for filenames and directories (`*_template`):
-* Track: `id`,`name`,`mix_name`,`slug`,`artists`,`remixers`,`number`,`length`,`key`,`bpm`,`genre`,`subgenre`,`genre_with_subgenre`,`subgenre_or_genre`,`isrc`,`label`
-* Release: `id`,`name`,`slug`,`artists`,`remixers`,`date`,`year`,`track_count`,`bpm_range`,`catalog_number`,`upc`,`label`
-* Playlist: `id`,`name`,`first_genre`,`track_count`,`bpm_range`,`length`,`created_date`,`updated_date`
-* Chart: `id`,`name`,`slug`,`first_genre`,`track_count`,`creator`,`created_date`,`published_date`,`updated_date`
-* Artist: `id`, `name`, `slug`
-* Label: `id`, `name`, `slug`, `created_date`, `updated_date`
-
-Default `tag_mappings` config:
-```yaml
-tag_mappings:
-   flac:
-      track_name: "TITLE"
-      track_artists: "ARTIST"
-      track_number: "TRACKNUMBER"
-      track_subgenre_or_genre: "GENRE"
-      track_key: "KEY"
-      track_bpm: "BPM"
-      track_isrc: "ISRC"
-   
-      release_name: "ALBUM"
-      release_artists: "ALBUMARTIST"
-      release_date: "DATE"
-      release_track_count: "TOTALTRACKS"
-      release_catalog_number: "CATALOGNUMBER"
-      release_label: "LABEL"
-   m4a:
-      track_name: "TITLE"
-      track_artists: "ARTIST"
-      track_number: "TRACKNUMBER"
-      track_genre: "GENRE"
-      track_key: "KEY"
-      track_bpm: "BPM"
-      track_isrc: "ISRC"
-   
-      release_name: "ALBUM"
-      release_artists: "ALBUMARTIST"
-      release_date: "DATE"
-      release_track_count: "TOTALTRACKS"
-      release_catalog_number: "CATALOGNUMBER"
-      release_label: "LABEL"
-```
-
-As you can see, each key here represents a predefined value from either a release or a track that you can use to customize what is written to which tags. When you add an entry in the mappings for any format (for e.g., `flac`), only the tags that you specify will be written.
-
-All tags by default are converted to uppercase, but since some M4A players might not recognize it, you can write the tag in lowercase and add the `_raw` suffix to bypass the conversion. *(This applies to M4A tags only)*
-
-For e.g., Traktor doesn't recognize the track key tag in uppercase, so you have to add:
-```yaml
-tag_mappings:
-   m4a:
-      track_key: "initialkey_raw"
-```
-
-Available `tag_mappings` keys: `track_id`,`track_url`,`track_name`,`track_artists`,`track_artists_limited`,`track_remixers`,`track_remixers_limited`,`track_number`,`track_number_with_padding`,`track_number_with_total`,`track_genre`,`track_subgenre`,`track_genre_with_subgenre`,`track_subgenre_or_genre`,`track_key`,`track_bpm`,`track_isrc`,`release_id`,`release_url`,`release_name`,`release_artists`,`release_artists_limited`,`release_remixers`,`release_remixers_limited`,`release_date`,`release_year`,`release_track_count`,`release_track_count_with_padding`,`release_catalog_number`,`release_upc`,`release_label`,`release_label_url`
-
-Available `key_system` options:
-
-| System           | Example           |
-|------------------|-------------------|
-| `standard`       | Eb Minor, F Major |
-| `standard-short` | Ebm, F            |
-| `openkey`        | 7m, 12d           |
-| `camelot`        | 2A, 7B            |
-
-Proxy URL format example: `http://username:password@127.0.0.1:8080`
-
-Usage
----
-
-Run BeatportDL and enter Beatport or Beatsource URL or search query:
-```shell
-./beatportdl
-Enter url or search query:
-```
-By default, search returns the results from beatport, if you want to search on beatsource instead, include `@beatsource` tag in the query
-
-...or specify the URL using positional arguments:
-```shell
-./beatportdl https://www.beatport.com/track/strobe/1696999 https://www.beatport.com/track/move-for-me/591753
-```
-...or provide a text file with urls (separated by a newline)
-```shell
-./beatportdl file.txt file2.txt
-```
-
-URL types that are currently supported: **Tracks, Releases, Playlists, Charts, Labels, Artists**
-
-Building
----
-Required dependencies:
-* [TagLib](https://github.com/taglib/taglib) >= 2.0
-* [zlib](https://github.com/madler/zlib) >= 1.2.3
-* [Zig C/C++ Toolchain](https://github.com/ziglang/zig) >= 0.14.0
-
-BeatportDL uses [TagLib](https://taglib.org/) C bindings to handle audio metadata and therefore requires [CGO](https://go.dev/wiki/cgo)
-
-Makefile is adapted for cross-compilation and uses [Zig toolchain](https://github.com/ziglang/zig)
-
-To compile BeatportDL with Zig using Makefile, you must specify the paths to the C/C++ libraries folder and headers folder for the desired OS and architecture with `-L` (for libraries) and `-I` (for headers) flags using environment variables: `MACOS_ARM64_LIB_PATH`, `MACOS_AMD64_LIB_PATH`, `LINUX_AMD64_LIB_PATH`, `LINUX_ARM64_LIB_PATH`, `WINDOWS_AMD64_LIB_PATH`
-
-One line example *(for unix and unix-like os)*
-```shell
-MACOS_ARM64_LIB_PATH="-L/usr/local/lib -I/usr/local/include" \
-make darwin-arm64
-```
-
-You can also create an `.env` file in the project folder and specify all environment variables in it:
-```
-MACOS_ARM64_LIB_PATH=-L/libraries/for/macos-arm64 -I/headers/for/macos-arm64
-MACOS_AMD64_LIB_PATH=-L/libraries/for/macos-amd64 -I/headers/for/macos-amd64
-LINUX_AMD64_LIB_PATH=-L/libraries/for/linux-amd64 -I/headers/for/linux-amd64
-LINUX_ARM64_LIB_PATH=-L/libraries/for/linux-arm64 -I/headers/for/linux-arm64
-WINDOWS_AMD64_LIB_PATH=-L/libraries/for/windows-amd64 -I/headers/for/windows-amd64
-```
+If Beats fits your setup, star the repository so other Beatport users can find it—and tell us what would make you keep using it.
